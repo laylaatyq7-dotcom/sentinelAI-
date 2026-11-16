@@ -762,6 +762,7 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 app.include_router(router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
