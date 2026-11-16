@@ -23,13 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app
 VERSION = "1.0.0"
 
 # ============================ SECTION: settings ============================ #
@@ -768,7 +762,13 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 app.include_router(router)
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def error_response(status: int, code: str, message: str, request: Optional[Request] = None, details: Optional[list] = None) -> JSONResponse:
     """Every error leaves the API in the same JSON shape."""
