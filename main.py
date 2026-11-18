@@ -873,5 +873,6 @@ def root():
 
 
 @app.get("/health", tags=["Health"], summary="UptimeRobot / Render health check")
+@app.head("/health", tags=["Health"], summary="UptimeRobot / Render health check HEAD")
 def health():
     return {"status": "ok"}
