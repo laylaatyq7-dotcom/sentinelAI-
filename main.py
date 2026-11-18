@@ -14,21 +14,22 @@ import uuid
 from bisect import bisect_right
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from fastapi.middleware.cors import CORSMiddleware
-VERSION = "1.0.0"
+
+VERSION = "1.0.1"
 
 # ============================ SECTION: settings ============================ #
-# All configuration comes from environment variables (set them in the Render dashboard).
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
-# Secret that RapidAPI adds to every proxied request (header X-RapidAPI-Proxy-Secret).
+# Optional gateway secrets. If unset, endpoints remain open so multiple marketplaces work out-of-the-box.
 RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "").strip()
+API_MARKET_PROXY_SECRET = os.getenv("API_MARKET_PROXY_SECRET", "").strip()
 MAX_CONTENT_CHARS = int(os.getenv("MAX_CONTENT_CHARS", "200000"))
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", "500000"))
 ENABLE_DOCS = os.getenv("ENABLE_DOCS", "true").lower() == "true"
@@ -43,12 +44,9 @@ ENGINE_VERSION = "1.0.0"
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 SEVERITY_WEIGHT = {"critical": 40, "high": 20, "medium": 8, "low": 2, "info": 0}
-MAX_MATCHES_PER_RULE = 2000  # hard cap so a hostile payload cannot make one rule run away
+MAX_MATCHES_PER_RULE = 2000
 
 
-# --------------------------------------------------------------------------- #
-# Validators (reduce false positives)
-# --------------------------------------------------------------------------- #
 def luhn_ok(digits: str) -> bool:
     total, alt = 0, False
     for ch in reversed(digits):
@@ -118,7 +116,7 @@ def not_placeholder(value: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Masking (what the API returns instead of the raw value)
+# Masking
 # --------------------------------------------------------------------------- #
 def mask_secret(v: str) -> str:
     n = len(v)
@@ -147,7 +145,7 @@ def mask_iban(v: str) -> str:
     return s[:4] + "*" * (len(s) - 6) + s[-2:]
 
 
-def keep_as_is(v: str) -> str:  # for markers that are not themselves secret, e.g. a PEM header line
+def keep_as_is(v: str) -> str:
     return v
 
 
@@ -157,7 +155,7 @@ def keep_as_is(v: str) -> str:  # for markers that are not themselves secret, e.
 @dataclass(frozen=True)
 class Rule:
     id: str
-    category: str  # "secrets" or "pii"
+    category: str
     severity: str
     title: str
     pattern: re.Pattern
@@ -250,7 +248,6 @@ def _risk_level(by_severity: dict[str, int]) -> str:
 def scan_content(content: str, checks: list[str], max_findings: int) -> ScanResult:
     line_starts = [0] + [m.end() for m in re.finditer("\n", content)]
 
-    # 1) Collect candidate matches from every enabled rule.
     candidates: list[tuple[Rule, int, int, int, str]] = []
     for idx, rule in enumerate(RULES):
         if rule.category not in checks:
@@ -266,7 +263,6 @@ def scan_content(content: str, checks: list[str], max_findings: int) -> ScanResu
             if count >= MAX_MATCHES_PER_RULE:
                 break
 
-    # 2) Resolve overlaps: highest severity wins (ties: earlier position, then rule order).
     candidates.sort(key=lambda c: (-SEVERITY_RANK[c[0].severity], c[2], c[1]))
     starts: list[int] = []
     ends: list[int] = []
@@ -281,7 +277,6 @@ def scan_content(content: str, checks: list[str], max_findings: int) -> ScanResu
         ends.insert(i, end)
         accepted.append((rule, start, end, value))
 
-    # 3) Order for presentation: severity first, then position in the text.
     accepted.sort(key=lambda a: (-SEVERITY_RANK[a[0].severity], a[1]))
 
     by_severity = {s: 0 for s in SEVERITY_RANK}
@@ -302,7 +297,6 @@ def scan_content(content: str, checks: list[str], max_findings: int) -> ScanResu
             "line": line,
             "column": start - line_starts[line - 1] + 1,
             "match_preview": rule.mask(value),
-            # One-way hash for de-duplicating secrets. Omitted for PII, whose small value space is guessable.
             "fingerprint": hashlib.sha256(value.encode("utf-8")).hexdigest()[:12] if rule.category == "secrets" else None,
             "recommendation": rule.recommendation,
         })
@@ -319,6 +313,7 @@ def scan_content(content: str, checks: list[str], max_findings: int) -> ScanResu
     }
     return ScanResult(findings=findings, summary=summary, lines=len(line_starts), chars=len(content))
 
+
 # ============================ SECTION: headers ============================= #
 PENALTY = {"high": 20, "medium": 10, "low": 5, "info": 0}
 
@@ -328,7 +323,7 @@ def _grade(score: int) -> str:
 
 
 def analyze_headers(headers: dict[str, str]) -> dict:
-    h = {k.strip().lower(): v.strip() for k, v in headers.items()}
+    h = {str(k).strip().lower(): str(v).strip() for k, v in headers.items()}
     findings: list[dict] = []
     passed: list[str] = []
 
@@ -406,7 +401,7 @@ def analyze_headers(headers: dict[str, str]) -> dict:
     else:
         passed.append("permissions_policy")
 
-    # Cross-origin isolation (informational)
+    # Cross-origin isolation
     if "cross-origin-opener-policy" not in h:
         add("coop", "Cross-Origin-Opener-Policy", "Cross-Origin-Opener-Policy is not set", "info",
             "Optional hardening that isolates your page from cross-origin windows.",
@@ -460,15 +455,16 @@ def analyze_headers(headers: dict[str, str]) -> dict:
         "passed_checks": passed,
     }
 
+
 # ============================ SECTION: schemas ============================= #
 Severity = Literal["critical", "high", "medium", "low", "info"]
 CheckName = Literal["secrets", "pii"]
 
 
-# ----------------------------- /v1/scan ----------------------------------- #
 class ScanRequest(BaseModel):
+    # ignore extra fields instead of failing if marketplace test UIs attach metadata
     model_config = ConfigDict(
-        extra="forbid",  # unknown fields are rejected, so typos do not silently pass
+        extra="ignore",
         json_schema_extra={
             "example": {
                 "content": "db_url = postgres://admin:Zx9fQ2mK8vLp3T@db.internal:5432/app\ncontact: jane.doe@example.com",
@@ -488,33 +484,47 @@ class ScanRequest(BaseModel):
         default_factory=lambda: ["secrets", "pii"],
         min_length=1,
         max_length=2,
-        description="Which detectors to run: 'secrets' (API keys, tokens, private keys) and/or 'pii' (cards, SSNs, IBANs, emails).",
+        description="Which detectors to run: 'secrets' and/or 'pii'. Accepts a list or comma-separated string.",
     )
-    max_findings: int = Field(default=100, ge=1, le=500, description="Maximum findings returned (counts in the summary are always complete).")
+    max_findings: int = Field(default=100, ge=1, le=500, description="Maximum findings returned.")
 
-    @field_validator("content")
+    @field_validator("content", mode="before")
     @classmethod
-    def content_not_blank(cls, v: str) -> str:
+    def coerce_and_validate_content(cls, v: Any) -> str:
+        if v is None:
+            raise ValueError("'content' is required and cannot be null")
+        if not isinstance(v, str):
+            v = str(v)
         if not v.strip():
-            raise ValueError("content must not be blank")
+            raise ValueError("'content' must not be empty or whitespace-only")
         return v
 
-    @field_validator("checks")
+    @field_validator("checks", mode="before")
     @classmethod
-    def unique_checks(cls, v: list[str]) -> list[str]:
-        return list(dict.fromkeys(v))
+    def normalize_checks(cls, v: Any) -> list[str]:
+        if v is None or v == "":
+            return ["secrets", "pii"]
+        if isinstance(v, str):
+            items = [item.strip().lower() for item in v.split(",") if item.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            items = [str(item).strip().lower() for item in v if str(item).strip()]
+        else:
+            raise ValueError("'checks' must be a list of strings (e.g. ['secrets', 'pii']) or comma-separated string")
+        if not items:
+            return ["secrets", "pii"]
+        return list(dict.fromkeys(items))
 
 
 class Finding(BaseModel):
     id: str
-    rule: str = Field(description="Stable rule identifier, see GET /v1/rules.")
+    rule: str
     category: CheckName
     title: str
     severity: Severity
-    line: int = Field(description="1-based line number.")
-    column: int = Field(description="1-based column number.")
-    match_preview: str = Field(description="Masked value. The full secret or personal data is never returned.")
-    fingerprint: Optional[str] = Field(default=None, description="Short one-way hash of a secret, for de-duplication (secrets only).")
+    line: int
+    column: int
+    match_preview: str
+    fingerprint: Optional[str] = None
     recommendation: str
 
 
@@ -543,10 +553,9 @@ class ScanResponse(BaseModel):
     meta: ScanMeta
 
 
-# -------------------------- /v1/headers/analyze --------------------------- #
 class HeadersRequest(BaseModel):
     model_config = ConfigDict(
-        extra="forbid",
+        extra="ignore",
         json_schema_extra={
             "example": {
                 "headers": {
@@ -562,18 +571,38 @@ class HeadersRequest(BaseModel):
         ...,
         min_length=1,
         max_length=100,
-        description="HTTP response headers of the site you want to check, as name/value pairs.",
+        description="HTTP response headers as a JSON object or raw 'Header: Value' lines.",
     )
 
-    @field_validator("headers")
+    @field_validator("headers", mode="before")
     @classmethod
-    def header_sizes(cls, v: dict[str, str]) -> dict[str, str]:
+    def coerce_headers(cls, v: Any) -> dict[str, str]:
+        if v is None:
+            raise ValueError("'headers' is required and cannot be null")
+        # Allow raw multi-line header strings as well as JSON dicts
+        if isinstance(v, str):
+            parsed: dict[str, str] = {}
+            for line in v.splitlines():
+                if ":" in line:
+                    k, val = line.split(":", 1)
+                    if k.strip():
+                        parsed[k.strip()] = val.strip()
+            if not parsed:
+                raise ValueError("'headers' string must contain 'Header-Name: value' lines")
+            v = parsed
+        if not isinstance(v, dict):
+            raise ValueError("'headers' must be a JSON object mapping header names to values")
+
+        cleaned: dict[str, str] = {}
         for name, value in v.items():
-            if not name.strip() or len(name) > 100:
-                raise ValueError("header names must be 1 to 100 characters")
-            if len(value) > 4096:
-                raise ValueError(f"value of header '{name[:50]}' exceeds 4096 characters")
-        return v
+            k = str(name).strip()
+            val = "" if value is None else str(value).strip()
+            if not k or len(k) > 100:
+                raise ValueError("Header names must be 1 to 100 characters")
+            if len(val) > 4096:
+                raise ValueError(f"Value of header '{k[:50]}' exceeds 4096 characters")
+            cleaned[k] = val
+        return cleaned
 
 
 class HeaderFinding(BaseModel):
@@ -600,7 +629,6 @@ class HeadersResponse(BaseModel):
     passed_checks: list[str]
 
 
-# ------------------------------- misc ------------------------------------- #
 class RuleInfo(BaseModel):
     id: str
     category: CheckName
@@ -633,43 +661,47 @@ class ErrorResponse(BaseModel):
 
 # ============================ SECTION: routes ============================== #
 def verify_proxy_secret(request: Request) -> None:
-    """Reject any request that did not come through the RapidAPI gateway.
+    """Verify gateway credentials if configured in environment variables."""
+    if not RAPIDAPI_PROXY_SECRET and not API_MARKET_PROXY_SECRET:
+        return
 
-    Read straight from the request (not declared as a parameter) so it does not
-    show up as an input field in your API docs.
-    """
-    if not RAPIDAPI_PROXY_SECRET:
-        return  # local development only; production startup requires a secret
-    supplied = request.headers.get("x-rapidapi-proxy-secret", "")
-    # compare_digest avoids leaking information through response timing
-    if not hmac.compare_digest(supplied.encode("utf-8"), RAPIDAPI_PROXY_SECRET.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Missing or invalid gateway credentials")
+    rapid_header = request.headers.get("x-rapidapi-proxy-secret", "")
+    apimarket_header = (
+        request.headers.get("x-apimarket-proxy-secret", "")
+        or request.headers.get("x-api-market-secret", "")
+    )
+
+    valid_rapid = bool(
+        RAPIDAPI_PROXY_SECRET
+        and rapid_header
+        and hmac.compare_digest(rapid_header.encode("utf-8"), RAPIDAPI_PROXY_SECRET.encode("utf-8"))
+    )
+    valid_apimarket = bool(
+        API_MARKET_PROXY_SECRET
+        and apimarket_header
+        and hmac.compare_digest(apimarket_header.encode("utf-8"), API_MARKET_PROXY_SECRET.encode("utf-8"))
+    )
+
+    if not (valid_rapid or valid_apimarket):
+        raise HTTPException(status_code=401, detail="Missing or invalid API gateway credentials")
 
 
-# Every route under /v1 requires the RapidAPI proxy secret.
 router = APIRouter(prefix="/v1", dependencies=[Depends(verify_proxy_secret)])
 
 _ERRORS = {
+    400: {"model": ErrorResponse, "description": "Bad request"},
     401: {"model": ErrorResponse, "description": "Missing or invalid gateway credentials"},
     413: {"model": ErrorResponse, "description": "Request body too large"},
     422: {"model": ErrorResponse, "description": "Validation error"},
-    429: {"model": ErrorResponse, "description": "Rate limit exceeded (enforced by the RapidAPI gateway)"},
     500: {"model": ErrorResponse, "description": "Unexpected server error"},
 }
 
 
-# These handlers are plain `def` (not `async def`) on purpose: scanning is CPU-bound, so FastAPI
-# runs them in a worker thread and the event loop stays free to serve other requests.
 @router.post(
     "/scan",
     response_model=ScanResponse,
     operation_id="scanContent",
     summary="Scan text or code for leaked secrets and personal data",
-    description=(
-        "Detects API keys, tokens, private keys and credentials in URLs (`secrets`), and payment card numbers, "
-        "US SSNs, IBANs and email addresses (`pii`). Matched values are masked in the response and the "
-        "submitted content is never stored or logged."
-    ),
     tags=["Scanning"],
     responses=_ERRORS,
 )
@@ -695,10 +727,6 @@ def scan(payload: ScanRequest, request: Request) -> ScanResponse:
     response_model=HeadersResponse,
     operation_id="analyzeHeaders",
     summary="Grade the security of a site's HTTP response headers",
-    description=(
-        "Send the response headers of your site and get a score, a grade (A to F) and specific fixes. "
-        "The service only analyzes the headers you submit; it never contacts your site."
-    ),
     tags=["Scanning"],
     responses=_ERRORS,
 )
@@ -726,20 +754,22 @@ def rules(request: Request) -> RulesResponse:
 # ============================ SECTION: app ================================= #
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{8,64}$")
 _ERROR_CODES = {
-    400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
-    405: "method_not_allowed", 413: "payload_too_large", 415: "unsupported_media_type",
-    422: "validation_error", 429: "rate_limited",
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    413: "payload_too_large",
+    415: "unsupported_media_type",
+    422: "validation_error",
+    429: "rate_limited",
 }
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Fail fast: a production API with no gateway secret would let anyone call it directly
-    # and bypass RapidAPI billing and rate limits.
-    if ENVIRONMENT == "production" and not RAPIDAPI_PROXY_SECRET:
-        raise RuntimeError("RAPIDAPI_PROXY_SECRET must be set when ENVIRONMENT=production")
-    if not RAPIDAPI_PROXY_SECRET:
-        log.warning("RAPIDAPI_PROXY_SECRET is empty: the API is open to direct calls (development mode)")
+    if not RAPIDAPI_PROXY_SECRET and not API_MARKET_PROXY_SECRET:
+        log.info("No gateway proxy secret set: accepting requests from any API marketplace gateway.")
     log.info("SentinelAI API %s started (environment=%s)", VERSION, ENVIRONMENT)
     yield
 
@@ -759,78 +789,89 @@ app = FastAPI(
     redoc_url="/redoc" if ENABLE_DOCS else None,
     openapi_url="/openapi.json",
 )
-app.include_router(router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
 
-def error_response(status: int, code: str, message: str, request: Optional[Request] = None, details: Optional[list] = None) -> JSONResponse:
-    """Every error leaves the API in the same JSON shape."""
+
+def error_response(
+    status: int,
+    code: str,
+    message: str,
+    request: Optional[Request] = None,
+    details: Optional[list] = None,
+) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None) if request is not None else None
-    body = {"error": {"code": code, "message": message, "request_id": request_id}}
+    body: dict[str, Any] = {"error": {"code": code, "message": message, "request_id": request_id}}
     if details:
         body["error"]["details"] = details
     return JSONResponse(status_code=status, content=body)
 
 
-@app.exception_handler(StarletteHTTPException)
-async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-    message = exc.detail if isinstance(exc.detail, str) else "Request failed"
-    return error_response(exc.status_code, _ERROR_CODES.get(exc.status_code, "http_error"), message, request)
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    # Only the field path, message and type are returned. Submitted values are left out on purpose,
-    # so secrets or personal data in a bad request are never echoed back or logged.
-    details = [
-        {"field": ".".join(str(p) for p in e["loc"][1:]) or "body", "message": e["msg"], "type": e["type"]}
-        for e in exc.errors()
-    ]
-    return error_response(422, "validation_error", "Request validation failed", request, details)
-
-
-@app.exception_handler(Exception)
-async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    log.exception("Unhandled error on %s %s", request.method, request.url.path)
-    return error_response(500, "internal_error", "An unexpected error occurred", request)
-
-
 @app.middleware("http")
-async def request_context(request: Request, call_next):
-    """Adds a request ID, enforces the body size limit and writes one access-log line per request."""
-    supplied = request.headers.get("x-request-id", "")
-    request.state.request_id = supplied if _REQUEST_ID_RE.match(supplied) else uuid.uuid4().hex
-    started = time.perf_counter()
+async def request_context_and_size_guard(request: Request, call_next):
+    incoming_id = request.headers.get("x-request-id") or request.headers.get("x-rapidapi-request-id") or ""
+    request_id = incoming_id if _REQUEST_ID_RE.match(incoming_id) else f"req_{uuid.uuid4().hex[:16]}"
+    request.state.request_id = request_id
 
-    length = request.headers.get("content-length", "")
-    if length.isdigit() and int(length) > MAX_BODY_BYTES:
-        response = error_response(413, "payload_too_large", "Request body is too large", request)
-    else:
-        try:
-            response = await call_next(request)
-        except Exception:  # last line of defense; the handler above covers most cases
-            log.exception("Unhandled error on %s %s", request.method, request.url.path)
-            response = error_response(500, "internal_error", "An unexpected error occurred", request)
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+        resp = error_response(
+            413,
+            "payload_too_large",
+            f"Request body exceeds maximum allowed size of {MAX_BODY_BYTES} bytes.",
+            request,
+        )
+        resp.headers["X-Request-ID"] = request_id
+        return resp
 
-    response.headers["X-Request-ID"] = request.state.request_id
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Cache-Control"] = "no-store"
-    # Log metadata only: never the body, headers or query string.
-    log.info(
-        "request_id=%s method=%s path=%s status=%s duration_ms=%.1f",
-        request.state.request_id, request.method, request.url.path, response.status_code,
-        (time.perf_counter() - started) * 1000,
-    )
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
-@app.get("/health", include_in_schema=False)
-def health() -> dict:
-    """Render health check. Not part of the public RapidAPI listing."""
-    return {"status": "ok", "version": VERSION}
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    details = []
+    for err in exc.errors():
+        loc = ".".join(str(part) for part in err.get("loc", []) if part != "body") or "body"
+        msg = err.get("msg", "Invalid value")
+        if msg.startswith("Value error, "):
+            msg = msg[len("Value error, "):]
+        details.append({"field": loc, "message": msg, "type": err.get("type", "value_error")})
+
+    summary_msg = details[0]["message"] if details else "Invalid request payload."
+    return error_response(422, "validation_error", summary_msg, request, details=details)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    code = _ERROR_CODES.get(exc.status_code, "http_error")
+    message = str(exc.detail) if exc.detail else "Request could not be processed."
+    return error_response(exc.status_code, code, message, request)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    log.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return error_response(500, "internal_server_error", "An unexpected server error occurred.", request)
+
+
+app.include_router(router)
+
+
+# ============================ SECTION: health ============================== #
+@app.get("/", tags=["Health"], summary="API root status")
+def root():
+    return {"service": "SentinelAI API", "version": VERSION, "status": "ok", "docs": "/docs"}
+
+
+@app.get("/health", tags=["Health"], summary="UptimeRobot / Render health check")
+def health():
+    return {"status": "ok"}
